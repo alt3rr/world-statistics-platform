@@ -377,6 +377,8 @@ class WorldStat_Country_ML {
 		}
 
 		$scatter_sets = [];
+		$projection   = self::project_vectors_pca_2d( $vectors );
+		$points_2d    = $projection['points'];
 		for ( $c = 0; $c < $k; ++$c ) {
 			$pts = [];
 			foreach ( $labels as $i => $lab ) {
@@ -384,8 +386,8 @@ class WorldStat_Country_ML {
 					continue;
 				}
 				$pts[] = [
-					'x' => (float) $vectors[ $i ][0],
-					'y' => (float) ( $vectors[ $i ][1] ?? $vectors[ $i ][0] ),
+					'x' => (float) ( $points_2d[ $i ]['x'] ?? 0.0 ),
+					'y' => (float) ( $points_2d[ $i ]['y'] ?? 0.0 ),
 				];
 			}
 			if ( ! empty( $pts ) ) {
@@ -396,9 +398,6 @@ class WorldStat_Country_ML {
 				];
 			}
 		}
-
-		$year_a = (string) ( $years[0] ?? '' );
-		$year_b = (string) ( $years[1] ?? $year_a );
 
 		return [
 			'ok'          => true,
@@ -425,8 +424,8 @@ class WorldStat_Country_ML {
 					'title'    => __( 'Профили показателей', 'flavor-worldstat' ),
 					'labels'   => [],
 					'datasets' => $scatter_sets,
-					'x_label'  => sprintf( __( 'z(%s)', 'flavor-worldstat' ), $year_a ),
-					'y_label'  => sprintf( __( 'z(%s)', 'flavor-worldstat' ), $year_b ),
+					'x_label'  => $projection['x_label'],
+					'y_label'  => $projection['y_label'],
 					'height'   => 300,
 				],
 			],
@@ -652,6 +651,182 @@ class WorldStat_Country_ML {
 			$out[] = ( $x - $mean ) / $std;
 		}
 		return $out;
+	}
+
+	/**
+	 * Проецирует многомерные векторы в 2D через PCA (PC1/PC2).
+	 *
+	 * @param list<list<float>> $vectors
+	 * @return array{points:list<array{x:float,y:float}>,x_label:string,y_label:string}
+	 */
+	private static function project_vectors_pca_2d( array $vectors ): array {
+		$n = count( $vectors );
+		if ( $n === 0 ) {
+			return [
+				'points'  => [],
+				'x_label' => __( 'PC1 (PCA)', 'flavor-worldstat' ),
+				'y_label' => __( 'PC2 (PCA)', 'flavor-worldstat' ),
+			];
+		}
+
+		$m = count( $vectors[0] ?? [] );
+		if ( $m === 0 ) {
+			return [
+				'points'  => array_fill( 0, $n, [ 'x' => 0.0, 'y' => 0.0 ] ),
+				'x_label' => __( 'PC1 (PCA)', 'flavor-worldstat' ),
+				'y_label' => __( 'PC2 (PCA)', 'flavor-worldstat' ),
+			];
+		}
+
+		$means = array_fill( 0, $m, 0.0 );
+		foreach ( $vectors as $row ) {
+			for ( $j = 0; $j < $m; ++$j ) {
+				$means[ $j ] += (float) ( $row[ $j ] ?? 0.0 );
+			}
+		}
+		for ( $j = 0; $j < $m; ++$j ) {
+			$means[ $j ] /= (float) $n;
+		}
+
+		$centered = [];
+		foreach ( $vectors as $row ) {
+			$c_row = [];
+			for ( $j = 0; $j < $m; ++$j ) {
+				$c_row[] = (float) ( $row[ $j ] ?? 0.0 ) - $means[ $j ];
+			}
+			$centered[] = $c_row;
+		}
+
+		$cov = array_fill( 0, $m, array_fill( 0, $m, 0.0 ) );
+		foreach ( $centered as $row ) {
+			for ( $a = 0; $a < $m; ++$a ) {
+				for ( $b = $a; $b < $m; ++$b ) {
+					$cov[ $a ][ $b ] += $row[ $a ] * $row[ $b ];
+				}
+			}
+		}
+		$den = max( 1, $n - 1 );
+		for ( $a = 0; $a < $m; ++$a ) {
+			for ( $b = $a; $b < $m; ++$b ) {
+				$v = $cov[ $a ][ $b ] / (float) $den;
+				$cov[ $a ][ $b ] = $v;
+				$cov[ $b ][ $a ] = $v;
+			}
+		}
+
+		$v1 = self::power_iteration( $cov, 120, null );
+		if ( null === $v1 ) {
+			return [
+				'points'  => array_fill( 0, $n, [ 'x' => 0.0, 'y' => 0.0 ] ),
+				'x_label' => __( 'PC1 (PCA)', 'flavor-worldstat' ),
+				'y_label' => __( 'PC2 (PCA)', 'flavor-worldstat' ),
+			];
+		}
+		$v2 = self::power_iteration( $cov, 120, $v1 );
+
+		$points = [];
+		foreach ( $centered as $row ) {
+			$x = self::dot_product( $row, $v1 );
+			$y = null === $v2 ? 0.0 : self::dot_product( $row, $v2 );
+			$points[] = [
+				'x' => (float) $x,
+				'y' => (float) $y,
+			];
+		}
+
+		return [
+			'points'  => $points,
+			'x_label' => __( 'PC1 (PCA)', 'flavor-worldstat' ),
+			'y_label' => __( 'PC2 (PCA)', 'flavor-worldstat' ),
+		];
+	}
+
+	/**
+	 * @param list<list<float>> $matrix
+	 * @param list<float>|null  $orthogonal_to
+	 * @return list<float>|null
+	 */
+	private static function power_iteration( array $matrix, int $max_iter, ?array $orthogonal_to ): ?array {
+		$m = count( $matrix );
+		if ( $m === 0 ) {
+			return null;
+		}
+
+		$seed = 1.0 / sqrt( (float) $m );
+		$v    = array_fill( 0, $m, $seed );
+
+		for ( $iter = 0; $iter < $max_iter; ++$iter ) {
+			$w = self::matrix_vector_multiply( $matrix, $v );
+			if ( null !== $orthogonal_to ) {
+				$proj = self::dot_product( $w, $orthogonal_to );
+				for ( $i = 0; $i < $m; ++$i ) {
+					$w[ $i ] -= $proj * $orthogonal_to[ $i ];
+				}
+			}
+
+			$norm = self::vector_norm( $w );
+			if ( $norm < 1e-12 ) {
+				return null;
+			}
+
+			for ( $i = 0; $i < $m; ++$i ) {
+				$w[ $i ] /= $norm;
+			}
+
+			$delta = 0.0;
+			for ( $i = 0; $i < $m; ++$i ) {
+				$delta += abs( $w[ $i ] - $v[ $i ] );
+			}
+
+			$v = $w;
+			if ( $delta < 1e-9 ) {
+				break;
+			}
+		}
+
+		return $v;
+	}
+
+	/**
+	 * @param list<list<float>> $matrix
+	 * @param list<float>       $vector
+	 * @return list<float>
+	 */
+	private static function matrix_vector_multiply( array $matrix, array $vector ): array {
+		$m   = count( $matrix );
+		$out = array_fill( 0, $m, 0.0 );
+		for ( $i = 0; $i < $m; ++$i ) {
+			$sum = 0.0;
+			foreach ( $matrix[ $i ] as $j => $val ) {
+				$sum += (float) $val * (float) ( $vector[ $j ] ?? 0.0 );
+			}
+			$out[ $i ] = $sum;
+		}
+		return $out;
+	}
+
+	/**
+	 * @param list<float> $a
+	 * @param list<float> $b
+	 */
+	private static function dot_product( array $a, array $b ): float {
+		$sum = 0.0;
+		$n   = min( count( $a ), count( $b ) );
+		for ( $i = 0; $i < $n; ++$i ) {
+			$sum += $a[ $i ] * $b[ $i ];
+		}
+		return $sum;
+	}
+
+	/**
+	 * @param list<float> $v
+	 */
+	private static function vector_norm( array $v ): float {
+		$sum = 0.0;
+		foreach ( $v as $x ) {
+			$sum += $x * $x;
+		}
+		return sqrt( $sum );
 	}
 
 	/**
